@@ -144,18 +144,6 @@ export class WebClient extends EventEmitter {
             agent: this.agentConfig,
           }, this.tlsConfig),
         )
-          .catch((error: got.GotError) => {
-            // Wrap errors in this packages own error types (abstract the implementation details' types)
-            if (error.name === 'RequestError') {
-              throw requestErrorWithOriginal(error);
-            } else if (error.name === 'ReadError') {
-              throw readErrorWithOriginal(error);
-            } else if (error.name === 'HTTPError') {
-              throw httpErrorWithOriginal(error);
-            } else {
-              throw error;
-            }
-          })
           .then((response: got.Response<string>) => {
             const result = this.buildResult(response);
             // log warnings in response metadata
@@ -163,17 +151,6 @@ export class WebClient extends EventEmitter {
               result.response_metadata.warnings.forEach(this.logger.warn);
             }
 
-            // handle rate-limiting
-            if (response.statusCode !== undefined && response.statusCode === 429) {
-              const retryAfterMs = result.retryAfter !== undefined ? result.retryAfter : (60 * 1000);
-              // NOTE: the following event could have more information regarding the api call that is being delayed
-              this.emit('rate_limited', retryAfterMs / 1000);
-              this.logger.info(`API Call failed due to rate limiting. Will retry in ${retryAfterMs / 1000} seconds.`);
-              // wait and return the result from calling `task` again after the specified number of seconds
-              return delay(retryAfterMs).then(task);
-            }
-
-            // For any error in the API response, treat them as irrecoverable by throwing an AbortError to end retries.
             if (!result.ok) {
               const error = errorWithCode(
                 new Error(`An API error occurred: ${result.error}`),
@@ -184,6 +161,28 @@ export class WebClient extends EventEmitter {
             }
 
             return result;
+          })
+          .catch((error: got.GotError) => {
+            // Wrap errors in this packages own error types (abstract the implementation details' types)
+            if (error.name === 'RequestError') {
+              throw requestErrorWithOriginal(error);
+            } else if (error.name === 'ReadError') {
+              throw readErrorWithOriginal(error);
+            } else if (error.name === 'HTTPError') {
+              // Special case: retry if 429;
+              if (error.statusCode === 429) {
+                const result = this.buildResult(error.response);
+                const retryAfterMs = result.retryAfter !== undefined ? result.retryAfter : (60 * 1000);
+                this.emit('rate_limited', retryAfterMs / 1000);
+                this.logger.info(`API Call failed due to rate limiting. Will retry in ${retryAfterMs / 1000} seconds.`);
+                // wait and return the result from calling `task` again after the specified number of seconds
+                return delay(retryAfterMs).then(task);
+              }
+
+              throw httpErrorWithOriginal(error);
+            } else {
+              throw error;
+            }
           });
       };
 
@@ -216,6 +215,14 @@ export class WebClient extends EventEmitter {
     permissions: {
       info: (this.apiCall.bind(this, 'apps.permissions.info')) as Method<methods.AppsPermissionsInfoArguments>,
       request: (this.apiCall.bind(this, 'apps.permissions.request')) as Method<methods.AppsPermissionsRequestArguments>,
+      resources: {
+        list: (this.apiCall.bind(this, 'apps.permissions.resources.list')) as
+          Method<methods.AppsPermissionsResourcesListArguments>,
+      },
+      scopes: {
+        list: (this.apiCall.bind(this, 'apps.permissions.scopes.list')) as
+          Method<methods.AppsPermissionsScopesListArguments>,
+      },
     },
   };
 
@@ -573,7 +580,7 @@ export class WebClient extends EventEmitter {
   /**
    * Processes an HTTP response into a WebAPICallResult by performing JSON parsing on the body and merging relevent
    * HTTP headers into the object.
-   * @param response
+   * @param response - an http response
    */
   private buildResult(response: got.Response<string>): WebAPICallResult {
     const data = JSON.parse(response.body);
@@ -674,10 +681,9 @@ function canBodyBeFormMultipart(body: FormCanBeURLEncoded | BodyCanBeFormMultipa
   return isStream(body);
 }
 
-
 /**
  * A factory to create WebAPIRequestError objects
- * @param original
+ * @param original - original error
  */
 function requestErrorWithOriginal(original: Error): WebAPIRequestError {
   const error = errorWithCode(
@@ -691,7 +697,7 @@ function requestErrorWithOriginal(original: Error): WebAPIRequestError {
 
 /**
  * A factory to create WebAPIReadError objects
- * @param original
+ * @param original - original error
  */
 function readErrorWithOriginal(original: Error): WebAPIReadError {
   const error = errorWithCode(
@@ -705,7 +711,7 @@ function readErrorWithOriginal(original: Error): WebAPIReadError {
 
 /**
  * A factory to create WebAPIHTTPError objects
- * @param original
+ * @param original - original error
  */
 function httpErrorWithOriginal(original: Error): WebAPIHTTPError {
   const error = errorWithCode(
